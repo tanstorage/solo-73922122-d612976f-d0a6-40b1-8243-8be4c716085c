@@ -12,6 +12,18 @@ Concurrency and rate-limit contract:
 * Every page (list or detail) is attempted at most three times. Exhausted
   retries and permanently unparseable pages are recorded as unfinished, so a
   round is never reported as successful in that case.
+* Source isolation: every request (the direct detail link as well as every
+  redirect hop) is resolved and checked against the configured site origin.
+  A cross-origin link is never enqueued or requested; a cross-origin redirect
+  target is never requested either. Both are recorded as unfinished without
+  claiming the announcement code, so the same code published in the other
+  column at a same-origin URL can still be collected. Redirects that stay on
+  the configured origin are followed normally.
+* Announcement codes are claimed when a same-origin detail job is queued, not
+  when the row is first seen. A duplicate row waits until the claim settles;
+  if the claim fails (including an off-site redirect), a different same-origin
+  candidate for that code is allowed to run, so a failed or blocked candidate
+  never permanently occupies the code.
 * Stop blocks queued/cooling requests from being sent, closes in-flight
   requests and the connection pool, and only then flips the state to stopped
   and permits a new round. A round id guards against a late response from the
@@ -25,6 +37,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -33,13 +46,23 @@ from .parser import ListParseResult, ParseError
 
 MAX_ATTEMPTS = 3
 MAX_IN_FLIGHT = 2
+MAX_REDIRECTS = 5
 GATE_POLL_SECONDS = 0.25
 EVENT_LOG_LIMIT = 200
 DEFAULT_RETRY_AFTER_SECONDS = 5
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 class RoundStopped(Exception):
     """Raised inside a round when cooperative stop has been requested."""
+
+
+class OffSiteBlocked(Exception):
+    """The candidate URL or a redirect target is outside the configured origin.
+
+    Terminal by design: the request is not sent (and, for a redirect hop, the
+    off-site target is not requested), so retrying would be pointless.
+    """
 
 
 @dataclass
@@ -61,6 +84,22 @@ class UnfinishedPage:
     url: str
     reason: str
     attempts: int
+
+
+@dataclass
+class CodeClaim:
+    """Ownership of an announcement code inside one round.
+
+    Exactly one same-origin detail job owns the code at a time. Rows from the
+    other column do not block a worker: they wait in ``waiters`` until the
+    owner settles. On success/failure the code is consumed and waiters are
+    counted as duplicates; when the owner is blocked off-site (or was stopped
+    before running), the code is released and the waiters are re-queued, so a
+    blocked candidate never occupies the number.
+    """
+
+    state: str = "pending"  # pending | done | failed | blocked
+    waiters: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +126,10 @@ class Crawler:
         # section display name -> list path
         self.sections = sections
         self.timeout = timeout
+        # Only scheme/host/port matter: every request must stay on this origin.
+        base_parts = urlsplit(self.base_url)
+        self._origin = (base_parts.scheme.lower(), (base_parts.hostname or "").lower(),
+                        base_parts.port or (443 if base_parts.scheme == "https" else 80))
 
         self._round_lock = asyncio.Lock()
         self._round_task: asyncio.Task | None = None
@@ -105,7 +148,7 @@ class Crawler:
             sections={name: SectionProgress() for name in sections},
         )
         self._records: dict[str, dict] = {}
-        self._seen_codes: set[str] = set()
+        self._code_claims: dict[str, CodeClaim] = {}
 
     # ------------------------------------------------------------------ state
     def snapshot(self) -> dict:
@@ -134,7 +177,7 @@ class Crawler:
             self._inflight = asyncio.Semaphore(MAX_IN_FLIGHT)
             self._cooldown_until = 0.0
             self._records: dict[str, dict] = {}
-            self._seen_codes: set[str] = set()
+            self._code_claims = {}
 
             self.state = RoundState(
                 round_id=round_id,
@@ -149,7 +192,9 @@ class Crawler:
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout),
                 headers={"User-Agent": "procurement-collector/1.0"},
-                follow_redirects=True,
+                # Redirects are followed manually so every hop can be checked
+                # against the configured origin before it is requested.
+                follow_redirects=False,
             )
             self._log(f"round {round_id} started; columns={list(self.sections)}")
             self._round_task = asyncio.create_task(self._run_round(round_id))
@@ -188,7 +233,7 @@ class Crawler:
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout),
                 headers={"User-Agent": "procurement-collector/1.0"},
-                follow_redirects=True,
+                follow_redirects=False,
             )
             self._log("in-flight requests closed and connections recycled; round stopped")
 
@@ -234,6 +279,13 @@ class Crawler:
                     self._mark_unfinished(
                         leftover, "round stopped before request was sent", leftover["attempts"]
                     )
+            # Rows held behind an unresolved code claim are unfinished too.
+            for claim in self._code_claims.values():
+                for waiter in claim.waiters:
+                    self._mark_unfinished(
+                        waiter, "round stopped before request was sent", waiter["attempts"]
+                    )
+                claim.waiters.clear()
             # Close the client used by this round (idempotent if stopped).
             if self._client is not None:
                 try:
@@ -274,7 +326,7 @@ class Crawler:
                     if job["kind"] == "list":
                         await self._handle_list(round_id, job, queue, pending)
                     else:
-                        await self._handle_detail(round_id, job, pending)
+                        await self._handle_detail(round_id, job, queue, pending)
                 except RoundStopped:
                     # Stop while waiting/cooling: no further request is sent.
                     self._mark_unfinished(job, "round stopped during cooldown/queue wait", job["attempts"])
@@ -295,6 +347,13 @@ class Crawler:
             )
         except RoundStopped:
             raise
+        except OffSiteBlocked as exc:
+            progress.list_failed += 1
+            self.state.pages_failed += 1
+            self._mark_unfinished(job, str(exc), job["attempts"])
+            self._log(f"[{section}] list page {job['page']} unfinished: {exc}")
+            pending["count"] -= 1
+            return
         except Exception as exc:
             progress.list_failed += 1
             self.state.pages_failed += 1
@@ -322,19 +381,61 @@ class Crawler:
                 self.state.pages_enqueued += 1
 
         for item in result.items:
-            if item.code in self._seen_codes:
+            item_url = self._resolve(item.url, base_path=self._section_path(section))
+            if not self._is_same_origin(item_url):
+                # Off-site candidate: never request it, never let it claim the
+                # announcement number. It is recorded as unfinished instead.
+                self._mark_unfinished(
+                    {
+                        "section": section,
+                        "kind": "detail",
+                        "page": item.code,
+                        "url": item_url,
+                    },
+                    OffSiteBlocked(
+                        "detail link points to another origin "
+                        f"({self._origin_label()} required); no request was sent"
+                    ).__str__(),
+                    attempts=0,
+                )
+                progress.detail_failed += 1
+                self.state.pages_failed += 1
+                self._log(
+                    f"[{section}] detail {item.code} unfinished: "
+                    f"off-site link {self._describe_url(item_url)} was not requested"
+                )
+                continue
+
+            detail_job = {
+                "section": section,
+                "kind": "detail",
+                "page": item.code,
+                "url": item_url,
+                "base_path": self._section_path(section),
+                "attempts": 0,
+            }
+            claim = self._code_claims.get(item.code)
+            if claim is not None and claim.state == "pending":
+                # Another column already owns this code. Hold the row without
+                # occupying a worker; it is re-queued if that owner is blocked.
+                detail_job["claim"] = claim
+                claim.waiters.append(detail_job)
+                pending["count"] += 1
+                self._log(
+                    f"[{section}] detail {item.code} held: code already being collected"
+                )
+                continue
+            if claim is not None and claim.state in ("done", "failed"):
+                # The code was already collected (or terminally failed).
                 progress.duplicated_skipped += 1
                 continue
-            self._seen_codes.add(item.code)
-            queue.put_nowait(
-                {
-                    "section": section,
-                    "kind": "detail",
-                    "page": item.code,
-                    "url": item.url,
-                    "attempts": 0,
-                }
-            )
+
+            # No owner yet, or the previous owner was blocked off-site: this
+            # same-origin candidate may claim the number.
+            claim = CodeClaim()
+            self._code_claims[item.code] = claim
+            detail_job["claim"] = claim
+            queue.put_nowait(detail_job)
             spawned += 1
             progress.detail_enqueued += 1
             self.state.pages_enqueued += 1
@@ -342,14 +443,32 @@ class Crawler:
         # This job is settled; the jobs it spawned keep the round alive.
         pending["count"] += spawned - 1
 
-    async def _handle_detail(self, round_id: str, job: dict, pending: dict) -> None:
+    async def _handle_detail(
+        self, round_id: str, job: dict, queue: asyncio.Queue, pending: dict
+    ) -> None:
         section = job["section"]
         progress = self.state.sections[section]
+        claim: CodeClaim = job["claim"]
         try:
+            if not self._is_same_origin(job["url"]):
+                raise OffSiteBlocked("detail link outside configured origin")
             detail = await self._get_parsed_page(round_id, job, parser.parse_detail_page)
         except RoundStopped:
+            # The coordinator drains the rows held behind this claim in the
+            # round finalizer, so leave ownership untouched here.
             raise
+        except OffSiteBlocked as exc:
+            # A cross-origin redirect hop is terminal: the code is released so
+            # a same-origin candidate for it can still run.
+            self._settle_claim(job["page"], claim, "blocked", queue, pending)
+            progress.detail_failed += 1
+            self.state.pages_failed += 1
+            self._mark_unfinished(job, str(exc), job["attempts"])
+            self._log(f"[{section}] detail {job['page']} unfinished: {exc}")
+            pending["count"] -= 1
+            return
         except Exception as exc:
+            self._settle_claim(job["page"], claim, "failed", queue, pending)
             progress.detail_failed += 1
             self.state.pages_failed += 1
             self._mark_unfinished(job, str(exc), MAX_ATTEMPTS)
@@ -365,14 +484,115 @@ class Crawler:
             "procurement_unit": detail["unit"],
             "deadline": detail["deadline"],
             "section": section,
-            "detail_url": self._absolute(job["url"]),
+            "detail_url": job.get("final_url", job["url"]),
         }
         self.state.records_count = len(self._records)
+        self._settle_claim(job["page"], claim, "done", queue, pending)
         pending["count"] -= 1
+
+    # ---------------------------------------------------------- source policy
+    def _section_path(self, section: str) -> str:
+        return self.sections[section]
+
+    def _resolve(self, url: str, base_path: str | None = None) -> str:
+        """Resolve a link exactly as a browser would, against the site origin.
+
+        Relative links (``/notice/A``, ``notice/A``, ``?page=2``) stay on the
+        configured origin. Absolute links keep their own origin so they can be
+        checked and rejected before any request is sent. ``base_path`` may be
+        a site-relative path or an absolute same-origin URL (redirect target).
+        """
+        url = (url or "").strip()
+        base = self.base_url + "/"
+        if base_path:
+            if base_path.startswith(("http://", "https://")):
+                base = base_path
+            else:
+                # A relative href resolves against the page's directory path.
+                base = self._join_path(base_path)
+        return urljoin(base, url)
+
+    def _join_path(self, path: str) -> str:
+        return self.base_url + "/" + path.lstrip("/")
+
+    def _is_same_origin(self, url: str) -> bool:
+        try:
+            parts = urlsplit(url)
+            port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+        except ValueError:
+            return False
+        return (
+            parts.scheme.lower() in ("http", "https")
+            and parts.scheme.lower() == self._origin[0]
+            and (parts.hostname or "").lower() == self._origin[1]
+            and port == self._origin[2]
+        )
+
+    def _origin_label(self) -> str:
+        scheme, host, port = self._origin
+        default_port = 443 if scheme == "https" else 80
+        return f"{scheme}://{host}" + ("" if port == default_port else f":{port}")
+
+    def _settle_claim(
+        self, code: str, claim: CodeClaim, state: str, queue, pending: dict | None
+    ) -> None:
+        """Finish ownership of ``code`` and resolve rows waiting on it.
+
+        * ``done``/``failed``: the code is consumed; waiters are counted as
+          duplicates and released.
+        * ``blocked``: the owning candidate never produced a same-origin
+          result, so ownership passes to the first waiter (which is queued),
+          or the code is released if there are no waiters.
+
+        ``queue``/``pending`` are ``None`` while a round is being torn down;
+        waiters are left in ``claim.waiters`` for the finalizer to drain.
+        """
+        if claim.state != "pending":
+            return
+        claim.state = state
+        if state == "blocked" and claim.waiters:
+            if queue is None:
+                return  # finalizer drains the rest
+            next_job = claim.waiters.pop(0)
+            self._code_claims[code] = CodeClaim(state="pending", waiters=claim.waiters)
+            next_job["claim"] = self._code_claims[code]
+            queue.put_nowait(next_job)
+            # The promoted row now becomes a real request: count it as enqueued.
+            self.state.sections[next_job["section"]].detail_enqueued += 1
+            self.state.pages_enqueued += 1
+            self._log(
+                f"code {code} released after off-site block; "
+                f"retrying same-origin candidate [{next_job['section']}]"
+            )
+            return
+
+        if state == "blocked":
+            # No waiter: leave the code unclaimed for any later row.
+            self._code_claims[code] = CodeClaim(state="blocked")
+            return
+
+        if queue is None:
+            return
+        for waiter in claim.waiters:
+            self.state.sections[waiter["section"]].duplicated_skipped += 1
+        if pending is not None:
+            pending["count"] -= len(claim.waiters)
+        if claim.waiters:
+            self._log(
+                f"code {code} {state}; skipped {len(claim.waiters)} duplicate row(s)"
+            )
+        claim.waiters.clear()
 
     # ------------------------------------------------------------- transport
     async def _get_parsed_page(self, round_id: str, job: dict, parse_func):
         """Fetch one URL with up to three attempts, then parse it.
+
+        Redirects are followed manually: every hop is resolved and checked
+        against the configured origin *before* it is requested. A redirect
+        that leaves the origin aborts the page immediately with
+        :class:`OffSiteBlocked`; no request is sent to the off-site target and
+        its body is never parsed. Same-origin relative/absolute redirects are
+        followed normally (bounded by ``MAX_REDIRECTS``).
 
         Transport errors and HTTP error statuses (including 429 after cooldown)
         consume attempts; a page whose HTML never parses within three attempts
@@ -386,8 +606,7 @@ class Crawler:
                 raise RoundStopped("round superseded before request")
             try:
                 async with self._inflight:
-                    assert self._client is not None
-                    response = await self._client.get(job["url"])
+                    response, final_url = await self._fetch_with_redirects(round_id, job)
             except httpx.RequestError as exc:
                 last_error = exc
                 if self._stop_event.is_set():
@@ -424,15 +643,64 @@ class Crawler:
                 continue
 
             try:
-                return parse_func(response.text)
+                result = parse_func(response.text)
             except ParseError as exc:
                 last_error = exc
                 self._log(
                     f"parse error ({job['attempts']}/{MAX_ATTEMPTS}) {job['url']}: {exc}"
                 )
                 continue
+            job["final_url"] = final_url
+            return result
 
         raise last_error if last_error else ParseError("unknown failure")
+
+    async def _fetch_with_redirects(
+        self, round_id: str, job: dict
+    ) -> tuple[httpx.Response, str]:
+        """Request ``job['url']`` and follow same-origin redirects manually.
+
+        The origin check happens before each hop, so an off-site target never
+        receives a request. Raises :class:`OffSiteBlocked` as soon as a hop
+        would leave the configured origin.
+        """
+        current = self._resolve(job["url"], base_path=job.get("base_path"))
+        for _hop in range(MAX_REDIRECTS + 1):
+            if not self._is_same_origin(current):
+                raise OffSiteBlocked(
+                    f"redirect/link leaves site origin ({self._origin_label()} required): "
+                    f"{self._describe_url(current)}"
+                )
+            if self._stop_event.is_set() or round_id != self._round_id:
+                raise RoundStopped("stop requested before redirect hop")
+            assert self._client is not None
+            response = await self._client.get(current)
+
+            if response.status_code not in REDIRECT_STATUSES:
+                return response, current
+
+            location = response.headers.get("Location", "").strip()
+            if not location:
+                return response, current  # caller reports the status
+            target = self._resolve(location, base_path=current)
+            if self._is_same_origin(target):
+                self._log(
+                    f"same-origin redirect {self._describe_url(response.request.url)} -> "
+                    f"{self._describe_url(target)}"
+                )
+            else:
+                self._log(
+                    f"redirect {self._describe_url(response.request.url)} -> "
+                    f"{self._describe_url(target)} leaves site origin; not requested"
+                )
+            current = target
+
+        raise ParseError(f"too many redirects (>{MAX_REDIRECTS})")
+
+    def _describe_url(self, url) -> str:
+        """Short, log-safe rendering of a URL (no query string payload)."""
+        parts = urlsplit(str(url))
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
 
     async def _pass_gate(self, round_id: str) -> None:
         """Block while stop is requested or a site-wide cooldown is active."""

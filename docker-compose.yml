@@ -1,4 +1,17 @@
 services:
+  procurement-offsite:
+    build:
+      context: ./site
+    container_name: procurement-offsite
+    command: ["uvicorn", "app.offsite:app", "--host", "0.0.0.0", "--port", "8081"]
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz?counters=1')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   procurement-site:
     build:
       context: ./site
@@ -11,6 +24,12 @@ services:
       SITE_RATE_WINDOW: "10"
       SITE_LATENCY_MS: "150"
       SITE_RETRY_AFTER: "5"
+      # Off-site samples rendered into the lists; the admin page can toggle
+      # them at runtime. The public base is used for hrefs, the internal base
+      # is how the site reads the off-site target's hit counter.
+      SITE_OFFSITE_SAMPLES: "true"
+      SITE_OFFSITE_BASE: "http://localhost:8081"
+      SITE_OFFSITE_INTERNAL: "http://procurement-offsite:8081"
     ports:
       - "8080:8080"
     healthcheck:
@@ -26,10 +45,16 @@ services:
     depends_on:
       procurement-site:
         condition: service_healthy
+      procurement-offsite:
+        condition: service_healthy
     environment:
       TARGET_BASE_URL: "http://procurement-site:8080"
       SECTION_TENDER_PATH: "/tenders"
       SECTION_AWARD_PATH: "/awards"
+      # Browser-only convenience proxy for the off-site sample host. It is not
+      # used by the crawler, which stays pinned to TARGET_BASE_URL's origin.
+      OFFSITE_PUBLIC_URL: "http://localhost:8081"
+      OFFSITE_INTERNAL_URL: "http://procurement-offsite:8081"
     ports:
       - "8000:8000"
     healthcheck:

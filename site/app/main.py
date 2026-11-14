@@ -7,7 +7,12 @@ Features used to exercise the collector:
   Retry-After header, switchable at runtime via /admin;
 * an artificial latency switch;
 * one intentionally malformed detail page (see data.BROKEN_DETAIL_CODE) to
-  demonstrate parse-failure handling and the unfinished-page report.
+  demonstrate parse-failure handling and the unfinished-page report;
+* switchable source-isolation samples (see data.OFFSITE_SAMPLES): rows whose
+  detail link is a direct off-site URL or a same-origin path that redirects
+  off-site, each with the same announcement number still published on-site in
+  the other column. ``/admin`` toggles both variants and shows how many hits
+  the off-site target has received (it must stay at zero).
 """
 
 from __future__ import annotations
@@ -18,15 +23,29 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .data import ANNOUNCEMENTS, BROKEN_DETAIL_CODE, PAGE_SIZE, find_by_code, section_rows
+from .data import (
+    ANNOUNCEMENTS,
+    BROKEN_DETAIL_CODE,
+    OFFSITE_SAMPLES,
+    PAGE_SIZE,
+    RELAY_SAMPLE_CODE,
+    detail_path,
+    find_by_code,
+    section_rows,
+)
 
 DEFAULT_RATE_LIMIT = int(os.getenv("SITE_RATE_LIMIT", "12"))
 DEFAULT_WINDOW = float(os.getenv("SITE_RATE_WINDOW", "10"))
 DEFAULT_LATENCY_MS = int(os.getenv("SITE_LATENCY_MS", "150"))
 RETRY_AFTER_SECONDS = int(os.getenv("SITE_RETRY_AFTER", "5"))
+# Public base for rendered off-site hrefs (browser reachable) and the internal
+# base the admin page uses to read the off-site target's hit counter.
+OFFSITE_PUBLIC_BASE = os.getenv("SITE_OFFSITE_BASE", "http://localhost:8081")
+OFFSITE_INTERNAL_BASE = os.getenv("SITE_OFFSITE_INTERNAL", "http://procurement-offsite:8081")
 
 
 class SlidingWindowLimiter:
@@ -56,6 +75,9 @@ async def lifespan(app: FastAPI):
     state["limiter_enabled"] = os.getenv("SITE_RATE_ENABLED", "true").lower() == "true"
     state["latency_ms"] = DEFAULT_LATENCY_MS
     state["limiter"] = SlidingWindowLimiter(DEFAULT_RATE_LIMIT, DEFAULT_WINDOW)
+    # Off-site samples are on by default so a plain round demonstrates the fix.
+    state["offsite_direct"] = os.getenv("SITE_OFFSITE_SAMPLES", "true").lower() == "true"
+    state["offsite_redirect"] = os.getenv("SITE_OFFSITE_SAMPLES", "true").lower() == "true"
     yield
 
 
@@ -120,11 +142,15 @@ def _render_list(section: str, section_title: str, page: int) -> HTMLResponse:
     total_pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
     page = max(1, min(page, total_pages))
     window_rows = rows[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+    samples_enabled = {
+        "direct": bool(state.get("offsite_direct")),
+        "redirect": bool(state.get("offsite_redirect")),
+    }
 
     trs = "".join(
         f"""<tr class="announcement">
         <td class="code">{a.code}</td>
-        <td><a href="/notice/{a.code}">{a.title}</a></td>
+        <td><a href="{detail_path(section, a.code, OFFSITE_PUBLIC_BASE, samples_enabled)}">{a.title}</a></td>
         <td>{a.unit}</td><td>{a.deadline}</td></tr>"""
         for a in window_rows
     )
@@ -188,11 +214,49 @@ async def notice_detail(code: str):
     return HTMLResponse(_page_shell("公告详情", body))
 
 
+# ------------------------------------------------------- source-isolation samples
+@app.get("/relay/{code}")
+async def relay_detail(code: str):
+    """Same-origin hop that redirects to the off-site host.
+
+    The collector may request this hop (it is on the configured origin) but
+    must refuse the next hop. The browser, however, follows it normally, so an
+    operator can see what the off-site page looks like.
+    """
+    return RedirectResponse(
+        url=f"{OFFSITE_PUBLIC_BASE.rstrip('/')}/fake/{code}", status_code=302
+    )
+
+
+@app.get("/relay-local/{code}")
+async def relay_local(code: str):
+    """Control sample: a normal same-origin relative redirect to the detail."""
+    return RedirectResponse(url=f"/notice/{code}", status_code=302)
+
+
 # ------------------------------------------------------------------ admin API
+async def _offsite_hits() -> int | None:
+    """Read the off-site target's request counter (health checks excluded)."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{OFFSITE_INTERNAL_BASE.rstrip('/')}/healthz")
+            resp.raise_for_status()
+            return int(resp.json().get("hits", 0))
+    except Exception:
+        return None
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
     limiter: SlidingWindowLimiter = state["limiter"]
     checked = "checked" if state.get("limiter_enabled") else ""
+    direct_checked = "checked" if state.get("offsite_direct") else ""
+    redirect_checked = "checked" if state.get("offsite_redirect") else ""
+    hits = await _offsite_hits()
+    hits_text = (
+        "不可用（目标服务未启动）" if hits is None
+        else f"{hits} 次（含浏览器手动访问；采集器请求应始终为 0）"
+    )
     body = f"""<h1>限流 / 延迟开关</h1>
 <div class="notice">修改后立即生效。触发 429 时响应头 Retry-After={RETRY_AFTER_SECONDS} 秒，
 采集器将对全站两个栏目同时冷却。</div>
@@ -204,13 +268,23 @@ async def admin_page():
   <input type="number" name="window" step="0.5" min="1" value="{limiter.window}"/>
   <label>每请求人工延迟（毫秒，0 表示关闭）</label>
   <input type="number" name="latency_ms" min="0" value="{state.get('latency_ms', 0)}"/>
+  <label><input type="checkbox" name="offsite_direct" {direct_checked}/> 越站直链样例
+    （招标 ZB-2026-005、中标 ZB-2026-015 的列表链接指向站外 {OFFSITE_PUBLIC_BASE}）</label>
+  <label><input type="checkbox" name="offsite_redirect" {redirect_checked}/> 站内跳转越站样例
+    （招标 ZB-2026-007 经 /relay 302 跳往站外）</label>
   <br/><button type="submit">保存并重置计数</button>
 </form>
 <form method="post" action="/admin/reset" style="margin-top:8px">
   <button type="submit" style="background:#475569">仅重置限流计数</button>
 </form>
-<p class="notice" style="margin-top:18px">异常详情页：<a href="/notice/{BROKEN_DETAIL_CODE}">
-/notice/{BROKEN_DETAIL_CODE}</a>（缺字段，用于验证采集器三次尝试后列入未完成页面）</p>"""
+<div class="notice" style="margin-top:18px">
+  越站目标累计收到请求：<b>{hits_text}</b>。
+  两个样例的同号公告在另一栏目均有站内详情，关闭开关后恢复为普通站内链接。
+</div>
+<p class="notice">异常详情页：<a href="/notice/{BROKEN_DETAIL_CODE}">
+/notice/{BROKEN_DETAIL_CODE}</a>（缺字段，用于验证采集器三次尝试后列入未完成页面）<br/>
+正常站内跳转样例：<a href="/relay-local/{RELAY_SAMPLE_CODE}">/relay-local/{RELAY_SAMPLE_CODE}</a>
+（相对 302 → /notice/{RELAY_SAMPLE_CODE}，采集器应正常跟随）</p>"""
     return HTMLResponse(_page_shell("管理", body))
 
 
@@ -220,6 +294,8 @@ async def admin_config(
     limit: int = Form(...),
     window: float = Form(...),
     latency_ms: int = Form(...),
+    offsite_direct: str | None = Form(default=None),
+    offsite_redirect: str | None = Form(default=None),
 ):
     limiter: SlidingWindowLimiter = state["limiter"]
     limiter.limit = max(1, limit)
@@ -227,6 +303,8 @@ async def admin_config(
     limiter.reset()
     state["limiter_enabled"] = limiter_enabled == "on"
     state["latency_ms"] = max(0, latency_ms)
+    state["offsite_direct"] = offsite_direct == "on"
+    state["offsite_redirect"] = offsite_redirect == "on"
     return RedirectResponse(url="/admin", status_code=303)
 
 
